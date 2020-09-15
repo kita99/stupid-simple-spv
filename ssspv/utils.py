@@ -1,7 +1,8 @@
-from hexdump import hexdump
 import binascii
 import hashlib
+import logging
 
+from hexdump import hexdump
 import base58
 
 from . import settings
@@ -53,3 +54,33 @@ def get_dns_seed(network=False):
 def dump_response(data, description):
     print(f'-------------- {description} ----------------')
     hexdump(data)
+
+
+def get_log_level_object(log_level):
+    if log_level == 'debug':
+        return logging.DEBUG
+
+    if log_level == 'info':
+        return logging.INFO
+
+    if log_level == 'warning':
+        return logging.WARNING
+
+    if log_level == 'critical':
+        return logging.CRITICAL
+
+    raise Exception(f'Invalid log level {log_level}')
+
+
+def create_logger(log_level, name=None):
+    log_format = logging.Formatter('%(asctime)s | %(name)s | %(levelname)s -> %(message)s')
+    ch = logging.StreamHandler()
+    ch.setFormatter(log_format)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(log_level)
+
+    logger.propagate = False
+    logger.addHandler(ch)
+
+    return logger

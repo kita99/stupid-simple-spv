@@ -1,67 +1,208 @@
+from collections import namedtuple
+import threading
 import socket
-import random
-import struct
+import time
 
-from hexdump import hexdump
+import dataset
 
-from .settings import logging
-from . import settings
-from . import messages
-from . import utils
+from .utils import create_logger
 
 
-def sock_read(sock, count):
-    ret = b''
+class Manager(threading.Thread):
+    ''' Manage network and peers.  '''
 
-    while len(ret) < count:
-        ret += sock.recv(count-len(ret))
+    def __init__(self, ssspv=None):
+        threading.Thread.__init__(self)
 
-    return ret
+        self.log_level = ssspv.log_level
+        self.log = create_logger(self.log_level, 'NETWORK MANAGER')
+        self.log.info('Initializing')
+
+        self.ssspv = ssspv
+        self.peers = {}
+        self.database = dataset.connect('sqlite:///data/network', engine_kwargs={'connect_args': {'check_same_thread': False}})
+        self.peer_addresses = self.load_known_peer_addresses()
+        self.DESIRED_PEER_AMOUNT = 2
+
+        self.network = Network(self)
+
+    def load_known_peer_addresses(self):
+        coin_name = self.ssspv.coin.PRETTY_NAME.lower()
+
+        return self.database[f'{coin_name}_peer_addresses']
+
+    def shutdown(self):
+        self.log.info('Shutting down')
+
+        if self.peers:
+            for _, peer in self.peers.items():
+                peer.shutdown()
+
+        self.running = False
+
+    def cleanup(self):
+        self.database.close()
+
+    def shutdown_dead_peers(self):
+        pass
+
+    def join(self, *args, **kwargs):
+        if self.peers:
+            for _, peer in self.peers.items():
+                peer.join(*args, **kwargs)
+
+        threading.Thread.join(self, *args, **kwargs)
+
+    def start(self):
+        self.running = False
+
+        threading.Thread.start(self)
+
+        while not self.running:
+            pass
+
+    def check_for_incoming_connections(self):
+        pass
+
+    def tick(self):
+        self.log.info('Tick')
+
+        self.check_for_incoming_connections()
+        self.shutdown_dead_peers()
+
+        if self.network.peers_are_behind_desired_amount():
+            peer_address = self.network.pick_healthy_peer_address()
+
+            if not peer_address:
+                return
+
+            self.network.spawn_peer(peer_address)
+
+    def run(self):
+        self.running = True
+
+        while self.running:
+            try:
+                self.tick()
+            except Exception as e:
+                self.log.warning(e)
+                self.log.warning('Bad bad not good')
+
+            time.sleep(1)
+
+        self.cleanup()
+        self.log.info('Stopped')
 
 
-def read_message(sock):
-    header = sock_read(sock, 24)
-    magic, command, payload_length, checksum = struct.unpack('<L12sL4s', header)
-    payload = sock_read(sock, payload_length)
+class Network:
+    def __init__(self, manager):
+        self.log_level = manager.log_level
+        self.log = create_logger(self.log_level, 'NETWORK')
+        self.log.info('Initializing')
 
-    logging.info(f'Received command: {command}')
+        self.manager = manager
+        self.active_peers = 0
 
-    assert utils.sha256checksum(payload) == checksum
+    def peers_are_behind_desired_amount(self):
+        if len(self.manager.peers) >= self.manager.DESIRED_PEER_AMOUNT:
+            return False
 
-    if settings.HEXDUMP:
-        utils.dump_response(header, 'header')
+        return True
 
-        if payload:
-            utils.dump_response(payload, 'header')
+    def discover_new_peer_addresses(self, index=0):
+        dns_seed = self.manager.ssspv.coin.DNS_SEEDS[index]
+        found_new = False
 
-    return command, payload
+        self.log.info(f'Attempting to discover new peer addresses using "{dns_seed}"')
+        peers = socket.gethostbyname_ex(dns_seed)[2]
+
+        for address in peers:
+            if self.manager.peer_addresses.find_one(address=address):
+                # Peer address already exists
+                continue
+
+            self.manager.peer_addresses.insert(dict(
+                address=address,
+                health='unknown',
+                last_used=None
+            ))
+
+            found_new = True
+
+        if found_new:
+            return True
+
+        if index < len(self.manager.ssspv.coin.DNS_SEEDS) - 1:
+            self.log.warning(f'Peer address discovery using "{dns_seed}" was unsuccessful')
+            return self.discover_new_peer_addresses(index + 1)
+
+        self.log.critical('Cant find enough peers to meet goal, consider updating the DNS seed list')
+        self.manager.shutdown()
+
+        return False
+
+    def pick_healthy_peer_address(self):
+        if self.manager.peer_addresses.count(health='good') > 0:
+            # Pick one
+            return
+
+        if self.manager.peer_addresses.count(health='unknown') > 0:
+            # Pick one
+            return
+
+        if self.discover_new_peer_addresses():
+            # Pick one
+            return
+
+        return False
 
 
-def connect():
-    peers = socket.gethostbyname_ex(utils.get_dns_seed())[2]
-    peer = random.choice(peers)
+    def spawn_peer(self, peer_address):
+        if not self.peers_are_behind_desired_amount():
+            return
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((peer, 8333))
-    logging.info(f'Connected to PEER: {peer}')
+        socket = 'IMPLEMENT_ME'
 
-    # Send version
-    sock.send(messages.version())
-    # Get response
-    command, payload = read_message(sock)
-    command, payload = read_message(sock)
+        self.manager.peers[peer_address] = Peer(self, socket, peer_address)
+        self.manager.peers[peer_address].start()
 
-    # Acknowledge version
-    sock.send(messages.verack())
-    command, payload = read_message(sock)
 
-    sock.send(messages.get_headers(hash_count=1, hash_stop=b'\x00'*32))
-    command, payload = read_message(sock)
-    command, payload = read_message(sock)
+class Peer(threading.Thread):
+    def __init__(self, network, socket, address):
+        threading.Thread.__init__(self)
 
-    # sock.send(messages.get_blocks(hash_count=1, hash_stop=b'\x00'*32))
+        self.log_level = network.log_level
+        self.log = create_logger(self.log_level, f'PEER ({address})')
+        self.log.info('Initializing')
 
-    # command, payload = read_message(sock)
-    # command, payload = read_message(sock)
+        self.network = network
+        self.socket = socket
+        self.address = address
 
-    return sock
+    def shutdown(self):
+        self.running = False
+        self.log.info('Shutting down')
+
+    def start(self):
+        self.running = False
+        threading.Thread.start(self)
+
+        while not self.running:
+            pass
+
+    def tick(self):
+        self.log.info('Tick')
+
+    def run(self):
+        self.running = True
+
+        while self.running:
+            try:
+                self.tick()
+            except:
+                self.log.warning('Bad bad not good')
+                pass
+
+            time.sleep(1)
+
+        self.log.info('Stopped')
