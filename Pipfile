@@ -12,6 +12,7 @@ base58 = "*"
 ecdsa = "*"
 hexdump = "*"
 typer = "*"
+dataset = "*"
 
 [requires]
 python_version = "3.8"
