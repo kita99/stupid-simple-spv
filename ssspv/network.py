@@ -1,11 +1,11 @@
-from collections import namedtuple
 import threading
+import random
 import socket
 import time
 
 import dataset
 
-from .utils import create_logger
+from . import utils
 
 
 class Manager(threading.Thread):
@@ -15,7 +15,7 @@ class Manager(threading.Thread):
         threading.Thread.__init__(self)
 
         self.log_level = ssspv.log_level
-        self.log = create_logger(self.log_level, 'NETWORK MANAGER')
+        self.log = utils.create_logger(self.log_level, 'NETWORK MANAGER')
         self.log.info('Initializing')
 
         self.ssspv = ssspv
@@ -97,7 +97,7 @@ class Manager(threading.Thread):
 class Network:
     def __init__(self, manager):
         self.log_level = manager.log_level
-        self.log = create_logger(self.log_level, 'NETWORK')
+        self.log = utils.create_logger(self.log_level, 'NETWORK')
         self.log.info('Initializing')
 
         self.manager = manager
@@ -109,9 +109,12 @@ class Network:
 
         return True
 
+    def get_active_peer_addresses(self):
+        return self.manager.peers.keys()
+
     def discover_new_peer_addresses(self, index=0):
         dns_seed = self.manager.ssspv.coin.DNS_SEEDS[index]
-        found_new = False
+        found_count = False
 
         self.log.info(f'Attempting to discover new peer addresses using "{dns_seed}"')
         peers = socket.gethostbyname_ex(dns_seed)[2]
@@ -127,9 +130,10 @@ class Network:
                 last_used=None
             ))
 
-            found_new = True
+            found_count += 1
 
-        if found_new:
+        if found_count > 0:
+            self.log.debug(f'Found {found_count} new peer addresses')
             return True
 
         if index < len(self.manager.ssspv.coin.DNS_SEEDS) - 1:
@@ -142,20 +146,29 @@ class Network:
         return False
 
     def pick_healthy_peer_address(self):
-        if self.manager.peer_addresses.count(health='good') > 0:
-            # Pick one
-            return
+        health = False
 
         if self.manager.peer_addresses.count(health='unknown') > 0:
-            # Pick one
-            return
+            health = 'unknown'
 
-        if self.discover_new_peer_addresses():
-            # Pick one
-            return
+        if self.manager.peer_addresses.count(health='good') > 0:
+            health = 'good'
 
-        return False
+        if not health:
+            if self.discover_new_peer_addresses():
+                return self.pick_healthy_peer_address()
 
+            return False
+
+        coin_name = self.manager.ssspv.coin.PRETTY_NAME.lower()
+        active_peer_addresses = self.get_active_peer_addresses()
+
+        query = utils.build_active_peer_exclusion_query(coin_name, health, active_peer_addresses)
+        prospects = self.manager.database.query(query)
+        address = random.choices(list(prospects))[0].get('address')
+
+        self.log.debug(f'Peer {address} is joining the pool')
+        return address
 
     def spawn_peer(self, peer_address):
         if not self.peers_are_behind_desired_amount():
@@ -172,7 +185,7 @@ class Peer(threading.Thread):
         threading.Thread.__init__(self)
 
         self.log_level = network.log_level
-        self.log = create_logger(self.log_level, f'PEER ({address})')
+        self.log = utils.create_logger(self.log_level, f'PEER ({address})')
         self.log.info('Initializing')
 
         self.network = network

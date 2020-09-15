@@ -84,3 +84,8 @@ def create_logger(log_level, name=None):
     logger.addHandler(ch)
 
     return logger
+
+
+def build_active_peer_exclusion_query(coin_name, health, active_peer_addresses):
+    addresses = ','.join([f"'{peer}'" for peer in active_peer_addresses])
+    return f"SELECT * FROM {coin_name}_peer_addresses WHERE health = '{health}' AND address NOT IN ({addresses})"
